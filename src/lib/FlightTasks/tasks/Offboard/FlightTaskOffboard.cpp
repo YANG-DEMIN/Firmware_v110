@@ -155,6 +155,7 @@ bool FlightTaskOffboard::update()
 	}
 
 	// Possible inputs:
+	// offboard允许的输入情况
 	// 1. position setpoint
 	// 2. position setpoint + velocity setpoint (velocity used as feedforward)
 	// 3. velocity setpoint

@@ -381,6 +381,9 @@ MultirotorMixer::mix(float *outputs, unsigned space)
 		mix_airmode_disabled(roll, pitch, yaw, thrust, outputs);
 		break;
 	}
+	// 修改混控，在这改根据roll, pitch, yaw, thrust来计算outputs
+
+	// 下面还可以使用油门 - 推力 模型
 
 	// Apply thrust model and scale outputs to range [idle_speed, 1].
 	// At this point the outputs are expected to be in [0, 1], but they can be outside, for example
