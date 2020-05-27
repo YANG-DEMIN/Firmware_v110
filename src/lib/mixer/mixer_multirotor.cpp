@@ -358,6 +358,7 @@ MultirotorMixer::mix(float *outputs, unsigned space)
 		return 0;
 	}
 
+	// 订阅actuator_control.msg
 	float roll    = math::constrain(get_control(0, 0) * _roll_scale, -1.0f, 1.0f);
 	float pitch   = math::constrain(get_control(0, 1) * _pitch_scale, -1.0f, 1.0f);
 	float yaw     = math::constrain(get_control(0, 2) * _yaw_scale, -1.0f, 1.0f);
@@ -367,6 +368,7 @@ MultirotorMixer::mix(float *outputs, unsigned space)
 	_saturation_status.value = 0;
 
 	// Do the mixing using the strategy given by the current Airmode configuration
+	// 原生mix，这里对应了参数MC_AIRMODE,默认为disabled
 	switch (_airmode) {
 	case Airmode::roll_pitch:
 		mix_airmode_rp(roll, pitch, yaw, thrust, outputs);
@@ -382,6 +384,11 @@ MultirotorMixer::mix(float *outputs, unsigned space)
 		break;
 	}
 	// 修改混控，在这改根据roll, pitch, yaw, thrust来计算outputs
+	float sqrt_2 = sqrt(2)/2;
+	outputs[0] = -sqrt_2 * roll +  sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
+	outputs[1] =  sqrt_2 * roll + -sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
+	outputs[2] =  sqrt_2 * roll +  sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
+	outputs[3] = -sqrt_2 * roll + -sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
 
 	// 下面还可以使用油门 - 推力 模型
 
