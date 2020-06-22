@@ -426,6 +426,7 @@ MulticopterAttitudeControl::publish_actuator_controls()
 	}
 }
 
+// 主函数
 void
 MulticopterAttitudeControl::Run()
 {

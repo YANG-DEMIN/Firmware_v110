@@ -336,8 +336,12 @@ bool MixingOutput::update()
 	}
 
 	/* do mixing */
+	// 启用混控
 	float outputs[MAX_ACTUATORS] {};
 	const unsigned mixed_num_outputs = _mixers->mix(outputs, _max_num_outputs);
+
+	// 如果我要改混控，是不是可以直接在这里计算？
+	// 或者在MultirotorMixer::mix函数中修改
 
 	/* the output limit call takes care of out of band errors, NaN and constrains */
 	output_limit_calc(_throttle_armed, armNoThrottle(), mixed_num_outputs, _reverse_output_mask,
@@ -365,6 +369,7 @@ bool MixingOutput::update()
 	reorderOutputs(_current_output_value);
 
 	/* now return the outputs to the driver */
+	// 将混控结果发布至驱动
 	if (_interface.updateOutputs(stop_motors, _current_output_value, mixed_num_outputs, n_updates)) {
 		actuator_outputs_s actuator_outputs{};
 		setAndPublishActuatorOutputs(mixed_num_outputs, actuator_outputs);

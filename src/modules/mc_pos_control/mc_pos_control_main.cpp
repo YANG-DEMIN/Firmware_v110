@@ -516,6 +516,7 @@ MulticopterPositionControl::print_status()
 	return 0;
 }
 
+//主程序
 void
 MulticopterPositionControl::Run()
 {
@@ -581,12 +582,15 @@ MulticopterPositionControl::Run()
 			_flight_tasks.setYawHandler(_wv_controller);
 
 			// update task
+			// 更新flight_task的设定值，即pos_sp，vel_sp等
 			if (!_flight_tasks.update()) {
 				// FAILSAFE
 				// Task was not able to update correctly. Do Failsafe.
+				// 原地降落
 				failsafe(setpoint, _states, false, !was_in_failsafe);
 
 			} else {
+				// 并从_flight_tasks读取setpoint和constraints
 				setpoint = _flight_tasks.getPositionSetpoint();
 				constraints = _flight_tasks.getConstraints();
 
@@ -612,7 +616,11 @@ MulticopterPositionControl::Run()
 			landing_gear_s gear = _flight_tasks.getGear();
 
 			// check if all local states are valid and map accordingly
+			// 检查当前状态有效性，并赋值_states变量
+			// 读取states
 			set_vehicle_states(setpoint.vz);
+
+			// 调用PositonController控制器，并计算输出
 
 			// handle smooth takeoff
 			_takeoff.updateTakeoffState(_control_mode.flag_armed, _vehicle_land_detected.landed, constraints.want_takeoff,
@@ -645,9 +653,11 @@ MulticopterPositionControl::Run()
 
 			// Update states, setpoints and constraints.
 			_control.updateConstraints(constraints);
+			// 将states赋值到PositionController类中
 			_control.updateState(_states);
 
 			// update position controller setpoints
+			// 更新期望点
 			if (!_control.updateSetpoint(setpoint)) {
 				warn_rate_limited("Position-Control Setpoint-Update failed");
 				failsafe(setpoint, _states, true, !was_in_failsafe);
@@ -656,6 +666,7 @@ MulticopterPositionControl::Run()
 			}
 
 			// Generate desired thrust and yaw.
+			// 位置控制程序
 			_control.generateThrustYawSetpoint(_dt);
 
 			// Fill local position, velocity and thrust setpoint.
@@ -682,6 +693,7 @@ MulticopterPositionControl::Run()
 			// Publish local position setpoint
 			// This message will be used by other modules (such as Landdetector) to determine
 			// vehicle intention.
+			// 发布本地位置设定点
 			_local_pos_sp_pub.publish(local_pos_sp);
 
 			// Inform FlightTask about the input and output of the velocity controller
@@ -696,6 +708,7 @@ MulticopterPositionControl::Run()
 			}
 
 			// Fill attitude setpoint. Attitude is computed from yaw and thrust setpoint.
+			// 计算期望姿态
 			_att_sp = ControlMath::thrustToAttitude(matrix::Vector3f(local_pos_sp.thrust), local_pos_sp.yaw);
 			_att_sp.yaw_sp_move_rate = _control.getYawspeedSetpoint();
 			_att_sp.fw_control_yaw = false;
@@ -706,6 +719,7 @@ MulticopterPositionControl::Run()
 			// an attitude setpoint is because for non-flighttask modes
 			// the attitude septoint should come from another source, otherwise
 			// they might conflict with each other such as in offboard attitude control.
+			// 发布姿态
 			publish_attitude();
 
 			// if there's any change in landing gear setpoint publish it

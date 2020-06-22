@@ -80,6 +80,7 @@ Vector3f RateControl::update(const Vector3f rate, const Vector3f rate_sp, const 
 	}
 
 	// PID control with feed forward
+	// 此处前馈为rate_sp，非加速度项前馈
 	Vector3f torque = _gain_p.emult(rate_error) + _rate_int - _gain_d.emult(rate_d) + _gain_ff.emult(rate_sp);
 
 	_rate_prev = rate;
