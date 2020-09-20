@@ -153,6 +153,7 @@ RoverPositionControl::control_position(const matrix::Vector2f &current_position,
 
 	bool setpoint = true;
 
+	// auto模式或offboard模式
 	if ((_control_mode.flag_control_auto_enabled ||
 	     _control_mode.flag_control_offboard_enabled) && pos_sp_triplet.current.valid) {
 		/* AUTONOMOUS FLIGHT */
@@ -178,6 +179,7 @@ RoverPositionControl::control_position(const matrix::Vector2f &current_position,
 		float mission_throttle = _param_throttle_cruise.get();
 
 		/* Just control the throttle */
+		// 计算油门？
 		if (_param_speed_control_mode.get() == 1) {
 			/* control the speed in closed loop */
 
@@ -246,6 +248,7 @@ RoverPositionControl::control_position(const matrix::Vector2f &current_position,
 			/* waypoint is a plain navigation waypoint or the takeoff waypoint, does not matter */
 			_gnd_control.navigate_waypoints(prev_wp, curr_wp, current_position, ground_speed_2d);
 
+			// 计算出最终控制量  - 油门
 			_act_controls.control[actuator_controls_s::INDEX_THROTTLE] = mission_throttle;
 
 			float desired_r = ground_speed_2d.norm_squared() / math::abs_t(_gnd_control.nav_lateral_acceleration_demand());
@@ -253,6 +256,7 @@ RoverPositionControl::control_position(const matrix::Vector2f &current_position,
 			float control_effort = (desired_theta / _param_max_turn_angle.get()) * math::sign(
 						       _gnd_control.nav_lateral_acceleration_demand());
 			control_effort = math::constrain(control_effort, -1.0f, 1.0f);
+			// 计算出最终控制量- 航向
 			_act_controls.control[actuator_controls_s::INDEX_YAW] = control_effort;
 
 		}
@@ -268,12 +272,19 @@ RoverPositionControl::control_position(const matrix::Vector2f &current_position,
 void
 RoverPositionControl::run()
 {
+	// 订阅控制模式
 	_control_mode_sub = orb_subscribe(ORB_ID(vehicle_control_mode));
+	// 订阅全局位置
 	_global_pos_sub = orb_subscribe(ORB_ID(vehicle_global_position));
+	// 订阅本地位置
 	_local_pos_sub = orb_subscribe(ORB_ID(vehicle_local_position));
+	// 订阅遥控器输入
 	_manual_control_sub = orb_subscribe(ORB_ID(manual_control_setpoint));
+	// 订阅位置航点(offboard 及 auto模式)
 	_pos_sp_triplet_sub = orb_subscribe(ORB_ID(position_setpoint_triplet));
+	// 订阅无人车姿态
 	_vehicle_attitude_sub = orb_subscribe(ORB_ID(vehicle_attitude));
+	// 订阅传感器
 	_sensor_combined_sub = orb_subscribe(ORB_ID(sensor_combined));
 
 	/* rate limit control mode updates to 5Hz */
@@ -308,12 +319,15 @@ RoverPositionControl::run()
 		}
 
 		/* check vehicle control mode for changes to publication state */
+		// 更新控制模式
 		vehicle_control_mode_poll();
 		//manual_control_setpoint_poll();
 
+		// 更新无人车加速度
 		_vehicle_acceleration_sub.update();
 
 		/* update parameters from storage */
+		// 更新参数
 		parameters_update();
 
 		bool manual_mode = _control_mode.flag_control_manual_enabled;
@@ -323,6 +337,7 @@ RoverPositionControl::run()
 			perf_begin(_loop_perf);
 
 			/* load local copies */
+			// 更新位置信息
 			orb_copy(ORB_ID(vehicle_global_position), _global_pos_sub, &_global_pos);
 			orb_copy(ORB_ID(vehicle_local_position), _local_pos_sub, &_local_pos);
 
@@ -330,6 +345,8 @@ RoverPositionControl::run()
 			vehicle_attitude_poll();
 
 			//Convert Local setpoints to global setpoints
+			// 将本地控制点转换为全局控制点
+			// 意味着必须有GPS才能控制offboard模式？？？？
 			if (_control_mode.flag_control_offboard_enabled) {
 				if (!globallocalconverter_initialized()) {
 					globallocalconverter_init(_local_pos.ref_lat, _local_pos.ref_lon,
@@ -345,12 +362,16 @@ RoverPositionControl::run()
 			// update the reset counters in any case
 			_pos_reset_counter = _global_pos.lat_lon_reset_counter;
 
+			// 小车全局速度
 			matrix::Vector3f ground_speed(_global_pos.vel_n, _global_pos.vel_e,  _global_pos.vel_d);
+			// 小车经纬度
 			matrix::Vector2f current_position((float)_global_pos.lat, (float)_global_pos.lon);
 
 			// This if statement depends upon short-circuiting: If !manual_mode, then control_position(...)
 			// should not be called.
 			// It doesn't really matter if it is called, it will just be bad for performance.
+			// 非手动模式 且 执行控制 输入为：当前经纬度、当前速度、位置期望点
+			// 如果是auto和offboard模式，control_position会返回true
 			if (!manual_mode && control_position(current_position, ground_speed, _pos_sp_triplet)) {
 
 				/* XXX check if radius makes sense here */
