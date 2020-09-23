@@ -47,6 +47,7 @@
 
 #include <termios.h>
 
+#include <lib/parameters/param.h>
 #include <mathlib/mathlib.h>
 #include <matrix/math.hpp>
 #include <px4_cli.h>
@@ -61,6 +62,7 @@
 #include "devices/src/emlid_reach.h"
 #include "devices/src/mtk.h"
 #include "devices/src/ubx.h"
+#include "devices/src/femtomes.h"
 
 #ifdef __PX4_LINUX
 #include <linux/spi/spidev.h>
@@ -74,7 +76,8 @@ typedef enum {
 	GPS_DRIVER_MODE_UBX,
 	GPS_DRIVER_MODE_MTK,
 	GPS_DRIVER_MODE_ASHTECH,
-	GPS_DRIVER_MODE_EMLIDREACH
+	GPS_DRIVER_MODE_EMLIDREACH,
+	GPS_DRIVER_MODE_FEMTOMES
 } gps_driver_mode_t;
 
 /* struct for dynamic allocation of satellite info data */
@@ -97,7 +100,7 @@ public:
 
 	GPS(const char *path, gps_driver_mode_t mode, GPSHelper::Interface interface, bool fake_gps, bool enable_sat_info,
 	    Instance instance, unsigned configured_baudrate);
-	virtual ~GPS();
+	~GPS() override;
 
 	/** @see ModuleBase */
 	static int task_spawn(int argc, char *argv[]);
@@ -714,6 +717,10 @@ GPS::run()
 				_helper = new GPSDriverEmlidReach(&GPS::callback, this, &_report_gps_pos, _p_report_sat_info);
 				break;
 
+			case GPS_DRIVER_MODE_FEMTOMES:
+				_helper = new GPSDriverFemto(&GPS::callback, this, &_report_gps_pos, _p_report_sat_info,heading_offset);
+				break;
+
 			default:
 				break;
 			}
@@ -813,6 +820,10 @@ GPS::run()
 					break;
 
 				case GPS_DRIVER_MODE_EMLIDREACH:
+					_mode = GPS_DRIVER_MODE_FEMTOMES;
+					break;
+
+				case GPS_DRIVER_MODE_FEMTOMES:
 					_mode = GPS_DRIVER_MODE_UBX;
 					px4_usleep(500000); // tried all possible drivers. Wait a bit before next round
 					break;
@@ -875,6 +886,10 @@ GPS::print_status()
 
 		case GPS_DRIVER_MODE_EMLIDREACH:
 			PX4_INFO("protocol: EMLIDREACH");
+			break;
+
+		case GPS_DRIVER_MODE_FEMTOMES:
+			PX4_INFO("protocol: FEMTOMES");
 			break;
 
 		default:
@@ -1044,7 +1059,7 @@ $ gps reset warm
 	PRINT_MODULE_USAGE_PARAM_FLAG('s', "Enable publication of satellite info", true);
 
 	PRINT_MODULE_USAGE_PARAM_STRING('i', "uart", "spi|uart", "GPS interface", true);
-	PRINT_MODULE_USAGE_PARAM_STRING('p', nullptr, "ubx|mtk|ash|eml", "GPS Protocol (default=auto select)", true);
+	PRINT_MODULE_USAGE_PARAM_STRING('p', nullptr, "ubx|mtk|ash|eml|fem", "GPS Protocol (default=auto select)", true);
 
 	PRINT_MODULE_USAGE_DEFAULT_COMMANDS();
 	PRINT_MODULE_USAGE_COMMAND_DESCR("reset", "Reset GPS device");
@@ -1179,6 +1194,9 @@ GPS *GPS::instantiate(int argc, char *argv[], Instance instance)
 
 			} else if (!strcmp(myoptarg, "eml")) {
 				mode = GPS_DRIVER_MODE_EMLIDREACH;
+
+			} else if (!strcmp(myoptarg, "fem")) {
+				mode = GPS_DRIVER_MODE_FEMTOMES;
 
 			} else {
 				PX4_ERR("unknown interface: %s", myoptarg);
