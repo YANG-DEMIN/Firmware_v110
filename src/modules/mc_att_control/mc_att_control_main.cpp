@@ -52,6 +52,39 @@
 #include <mathlib/math/Limits.hpp>
 #include <mathlib/math/Functions.hpp>
 
+
+#define MIN_TAKEOFF_THRUST    0.2f
+#define TPA_RATE_LOWER_LIMIT 0.05f
+
+#define AXIS_INDEX_ROLL 0
+#define AXIS_INDEX_PITCH 1
+#define AXIS_INDEX_YAW 2
+#define AXIS_COUNT 3
+
+/**
+ * Used for Model Based Control.
+ * Model Based Controller outputs commands of thrust and torques around three-axis,
+ * while the commands send by px4 to low-level mixer and motors are normalized values in 0~1(thrust) or -1~1(torque).
+ * By converting F&T commands to normalized commands, we can implement Model Based Control methods readily,
+ * using existing mixer and saturation limiter.
+ */
+/* Model of QAV250 */
+#define HALF_LENGTH		0.101f
+#define HALF_WIDTH		0.080f
+
+#define C_M				0.0097f		// C_M = drag torque / motor thrust.
+//#define THRUST_FACTOR	0.0f
+#define THRUST_FACTOR	0.4785f
+
+#define I_XX			3e-3f
+#define I_YY			2.7e-3f
+#define I_ZZ			6.0e-3f
+// Parameters of attitude(acc) estimator
+#define OMEGA_ATT		50.0f
+#define ZETA_ATT		0.8f
+
+
+
 using namespace matrix;
 
 MulticopterAttitudeControl::MulticopterAttitudeControl() :
@@ -105,6 +138,11 @@ MulticopterAttitudeControl::parameters_updated()
 	_rate_control.setIntegratorLimit(
 		Vector3f(_param_mc_rr_int_lim.get(), _param_mc_pr_int_lim.get(), _param_mc_yr_int_lim.get()));
 	_rate_control.setDTermCutoff(_loop_update_rate_hz, _param_mc_dterm_cutoff.get(), false);
+
+	_rate_int_lim = Vector3f(_param_mc_rr_int_lim.get(), _param_mc_pr_int_lim.get(), _param_mc_yr_int_lim.get());
+	_lp_filters_d.set_cutoff_frequency(_loop_update_rate_hz, _param_mc_dterm_cutoff.get());
+	_lp_filters_d.reset(_rates_prev);
+
 	_rate_control.setFeedForwardGain(
 		Vector3f(_param_mc_rollrate_ff.get(), _param_mc_pitchrate_ff.get(), _param_mc_yawrate_ff.get()));
 
@@ -357,9 +395,176 @@ MulticopterAttitudeControl::control_attitude()
 	}
 
 	// physical thrust axis is the negative of body z axis
+	// thrust设定值直接来自于位置环控制结果
 	_thrust_sp = -_v_att_sp.thrust_body[2];
 
 	_rates_sp = _attitude_control.update(Quatf(_v_att.q), Quatf(_v_att_sp.q_d), _v_att_sp.yaw_sp_move_rate);
+}
+
+/**
+ * Attitude controller.
+ * Input: 'vehicle_attitude_setpoint' topics (depending on mode)
+ * Output: '_rates_sp' vector, '_thrust_sp'
+ */
+void
+MulticopterAttitudeControl::control_attitude_motorloss_smc(float dt, const Vector3f &rates)
+{
+	_v_att_sp_sub.update(&_v_att_sp);
+
+	// reinitialize the setpoint while not armed to make sure no value from the last mode or flight is still kept
+	if (!_v_control_mode.flag_armed) {
+		Quatf().copyTo(_v_att_sp.q_d);
+		Vector3f().copyTo(_v_att_sp.thrust_body);
+	}
+
+	// physical thrust axis is the negative of body z axis
+	// thrust设定值直接来自于位置环控制结果
+	_thrust_sp = -_v_att_sp.thrust_body[2];
+
+	// Primary-axis attitude control
+	// compute corrected thrust_sp
+	float angle_n = math::min(abs(_lossctrl_nb_angle.get()), 10.0f) * 0.01745329f;	// deg->rad
+	_thrust_sp *= 1.0f / cosf(angle_n);
+
+	// compute n_B
+	Vector3f n_B(sinf(angle_n)*0.7071f, sinf(angle_n)*0.7071f, -cosf(angle_n));
+	n_B.normalize();
+
+	// compute ndes_B
+	Quatf q(_v_att.q);
+	Quatf qd(_v_att_sp.q_d);
+	q.normalize();
+	qd.normalize();
+	Dcmf R = Quatf(q);
+	Dcmf Rd = Quatf(qd);
+
+	Vector3f nd_I(-Rd(0, 2), -Rd(1, 2), -Rd(2, 2));
+	nd_I.normalize();
+	Vector3f nd_B = R.T() * nd_I;
+	nd_B.normalize();
+
+	Vector3f alpha_TSMC(_i_alpha_pri_axis, _i_alpha_pri_axis, _i_alpha_pri_axis);
+	Vector3f c_TSMC(_i_c_pri_axis, _i_c_pri_axis, _i_c_pri_axis);
+	Vector3f T_TSMC(_i_t_pri_axis, _i_t_pri_axis, _i_t_pri_axis);
+	Vector3f eta_TSMC(_i_eta_pri_axis, _i_eta_pri_axis, _i_eta_pri_axis);
+	Vector3f sign_S(0,0,0);
+	Vector3f attitude_err(0,0,0);
+
+	attitude_err(0) = n_B(0) - nd_B(0);
+	attitude_err(1) = n_B(1) - nd_B(1);
+
+	get_funcg_integPart(c_TSMC, alpha_TSMC, attitude_err, dt, _func_g_pri_axis);
+	_func_g_pri_axis = attitude_err + _func_g_pri_axis;
+	for(int i = 0; i <= 1; i++)
+	{
+		sign_S(i) = math::signNoZero(_func_g_pri_axis(i) - _func_g_prev_pri_axis(i));
+	}
+	_func_g_prev_pri_axis = _func_g_pri_axis;
+
+	get_un_TSMC(T_TSMC, eta_TSMC, sign_S, dt, _un_pri_axis, _un_v_pri_axis);
+	Vector3f eq_cont_part(0,0,0);
+	eq_cont_part = c_TSMC.emult(nolinear_part_TSMC(attitude_err, alpha_TSMC));
+
+
+	// control law part
+	if(_smc_enable_pri_axis < 0.5){
+		Vector2f miu_out;
+		miu_out(0) = _lossctrl_roll_p.get() * (n_B(0) - nd_B(0));
+		miu_out(1) = _lossctrl_pitch_p.get() * (n_B(1) - nd_B(1));
+
+		// neglect nd_I_dot
+		//_rates_sp(0) = 1.0f / nd_B(2) * (miu_out(1) + nd_B(0) * rates(2));
+		//_rates_sp(1) = -1.0f / nd_B(2) * (miu_out(0) - nd_B(1) * rates(2));
+		_rates_sp(0) = 1.0f / nd_B(2) * (miu_out(1) + nd_B(0) * rates(2));
+		_rates_sp(1) = -1.0f / nd_B(2) * (miu_out(0) - nd_B(1) * rates(2));
+		_rates_sp(2) = 0.0f; // just to initialize
+	}
+	else{
+		_rates_sp(0) = 1.0f / nd_B(2) * (eq_cont_part(1) + nd_B(0) * rates(2) - _un_pri_axis(2));
+		_rates_sp(1) = -1.0f / nd_B(2) * (eq_cont_part(0) - nd_B(1) * rates(2) - _un_pri_axis(1));
+		_rates_sp(2) = 0.0f; // just to initialize
+	}
+
+}
+
+/**
+ * Get integral par of func_g
+ */
+void
+MulticopterAttitudeControl::get_funcg_integPart(Vector3f c_TSMC, Vector3f alpha_TSMC, Vector3f rates_err, const float dt, Vector3f &x1)
+{
+    Vector3f x1_dot_1, x1_dot_2, x1_dot_3, x1_dot_4;
+    Vector3f x1_tmp;
+
+    x1_tmp = x1;	// x1: estimate of x
+    funcg_model(c_TSMC, alpha_TSMC, rates_err, x1_tmp, x1_dot_1);
+
+    x1_tmp = x1 + x1_dot_1 * dt/2.0f;
+    funcg_model(c_TSMC, alpha_TSMC, rates_err, x1_tmp, x1_dot_2);
+
+    x1_tmp = x1 + x1_dot_2 * dt/2.0f;
+    funcg_model(c_TSMC, alpha_TSMC, rates_err, x1_tmp, x1_dot_3);
+
+    x1_tmp = x1 + x1_dot_3 * dt;
+    funcg_model(c_TSMC, alpha_TSMC, rates_err, x1_tmp, x1_dot_4);
+
+    x1 += (x1_dot_1 + x1_dot_2 * 2.0f + x1_dot_3 * 2.0f + x1_dot_4) * dt/6.0f;
+}
+void MulticopterAttitudeControl::funcg_model(Vector3f &c_TSMC, Vector3f &alpha_TSMC, Vector3f &rates_err, Vector3f &x1, Vector3f &x1_dot)
+{
+    x1_dot = c_TSMC.emult(nolinear_part_TSMC(rates_err, alpha_TSMC));
+}
+
+
+/**
+ * Get un of TSMC
+ */
+void MulticopterAttitudeControl::get_un_TSMC(Vector3f T_TSMC, Vector3f eta_TSMC, Vector3f sign_S, const float dt, Vector3f &x1, Vector3f &x2)
+{
+    Vector3f x1_dot_1, x2_dot_1, x1_dot_2, x2_dot_2, x1_dot_3, x2_dot_3, x1_dot_4, x2_dot_4;
+    Vector3f x1_tmp, x2_tmp;
+
+    x1_tmp = x1;	// x1: estimate of x
+    x2_tmp = x2;	// x2: estimate of x' acceleration
+    un_model(T_TSMC, eta_TSMC, sign_S, x1_tmp, x2_tmp, x1_dot_1, x2_dot_1);
+
+    x1_tmp = x1 + x1_dot_1 * dt/2.0f;
+    x2_tmp = x2 + x2_dot_1 * dt/2.0f;
+    un_model(T_TSMC, eta_TSMC, sign_S, x1_tmp, x2_tmp, x1_dot_2, x2_dot_2);
+
+    x1_tmp = x1 + x1_dot_2 * dt/2.0f;
+    x2_tmp = x2 + x2_dot_2 * dt/2.0f;
+    un_model(T_TSMC, eta_TSMC, sign_S, x1_tmp, x2_tmp, x1_dot_3, x2_dot_3);
+
+    x1_tmp = x1 + x1_dot_3 * dt;
+    x2_tmp = x2 + x2_dot_3 * dt;
+    un_model(T_TSMC, eta_TSMC, sign_S, x1_tmp, x2_tmp, x1_dot_4, x2_dot_4);
+
+    x1 += (x1_dot_1 + x1_dot_2 * 2.0f + x1_dot_3 * 2.0f + x1_dot_4) * dt/6.0f;
+    x2 += (x2_dot_1 + x2_dot_2 * 2.0f + x2_dot_3 * 2.0f + x2_dot_4) * dt/6.0f;
+
+}
+
+void MulticopterAttitudeControl::un_model(Vector3f &T_TSMC, Vector3f &eta_TSMC, Vector3f &sign_S, Vector3f &x1, Vector3f &x2, Vector3f &x1_dot, Vector3f &x2_dot)
+{
+    Vector3f temp_x2(0,0,0);
+    x2_dot.zero();
+    for(int i = 0; i <= 2; i++)
+    {
+        temp_x2(i) = - eta_TSMC(i)*sign_S(i);
+    }
+    x1_dot = temp_x2 - T_TSMC.emult(x1);
+}
+
+Vector3f
+MulticopterAttitudeControl::nolinear_part_TSMC(Vector3f rates_err, Vector3f alpha_TSMC)
+{
+    Vector3f temp_nolinear(0,0,0);
+    for(int i = 0; i <=2; i++)
+    {
+        temp_nolinear(i) = pow(fabsf(rates_err(i)), alpha_TSMC(i))*math::signNoZero(rates_err(i));
+    }
+    return temp_nolinear;
 }
 
 /*
@@ -373,12 +578,437 @@ MulticopterAttitudeControl::control_attitude_rates(float dt, const Vector3f &rat
 	// reset integral if disarmed
 	if (!_v_control_mode.flag_armed || _vehicle_status.vehicle_type != vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
 		_rate_control.resetIntegral();
+		_rates_int.zero();
 	}
 
 	const bool landed = _vehicle_land_detected.maybe_landed || _vehicle_land_detected.landed;
 	_rate_control.setSaturationStatus(_saturation_status);
 	_att_control = _rate_control.update(rates, _rates_sp, dt, landed);
 }
+
+//smc
+void
+MulticopterAttitudeControl::control_attitude_rates_motorloss_smc(float dt, const Vector3f &rates)
+{
+	// reset integral if disarmed
+	if (!_v_control_mode.flag_armed || _vehicle_status.vehicle_type != vehicle_status_s::VEHICLE_TYPE_ROTARY_WING) {
+		_rate_control.resetIntegral();
+		_rates_int.zero();
+		_un.zero();
+		_un_v.zero();
+		_func_g.zero();
+		_func_g_prev.zero();
+	}
+
+	Vector3f rates_p_scaled = Vector3f(_param_mc_rollrate_p.get(), _param_mc_pitchrate_p.get(), _param_mc_yawrate_p.get());
+	Vector3f rates_i_scaled = Vector3f(_param_mc_rollrate_i.get(), _param_mc_pitchrate_i.get(), _param_mc_yawrate_i.get());
+	Vector3f rates_d_scaled = Vector3f(_param_mc_rollrate_d.get(), _param_mc_pitchrate_d.get(), _param_mc_yawrate_d.get());
+
+	Vector3f rates_err = _rates_sp - rates;
+
+	/* apply low-pass filtering to the rates for D-term */
+	Vector3f rates_filtered(_lp_filters_d.apply(rates));
+
+	/* estimate attitude rates and accelerations */
+	estimator_update(rates, dt, _x1, _x2);
+
+	/* compute torque_hat */
+	Vector3f inertia(_I_XX, _I_YY, _I_ZZ);
+	_torque_hat = inertia.emult(_x2) + _x1.cross(inertia.emult(_x1));	// tao = I*w_dot + w x I*w
+
+	_actuator_outputs_sub.update(&_actuator_outputs);
+	/* compute torque_motor through motor thrust model */
+	_torque_motor = compute_actuate_torque();
+	estimator_update(_torque_motor, dt, _x1_trq, _x2_trq);
+
+	_torque_dist = _torque_hat - _x1_trq;
+	_torque_dist_last = _torque_dist;
+	/* compute gyro moment */
+	Vector3f torque_affix = rates.cross(inertia.emult(rates));
+
+	/* Compensate nonlinear gyro moment and disturbed moment */
+	Vector3f compen_torque(0,0,0);
+
+	if(_nde_enable > 0.5){
+		compen_torque = torque_affix * 1.0f - _torque_dist * 1.0f;
+		}
+		else{
+		compen_torque = torque_affix * 1.0f - _torque_dist * 0.0f;
+	}
+
+	/* publish estimated disturbance */
+	_ext_torque.esti_dist[0] = _torque_dist(0);
+	_ext_torque.esti_dist[1] = _torque_dist(1);
+	_ext_torque.esti_dist[2] = _torque_dist(2);
+
+	_ext_torque.ft_hat[0] = _torque_hat(0);
+	_ext_torque.ft_hat[1] = _torque_hat(1);
+	_ext_torque.ft_hat[2] = _torque_hat(2);
+
+	_ext_torque.ft_motor[0] = _torque_motor(0);
+	_ext_torque.ft_motor[1] = _torque_motor(1);
+	_ext_torque.ft_motor[2] = _torque_motor(2);
+	_ext_torque.ft_motor_filter[0] = _x1_trq(0);
+	_ext_torque.ft_motor_filter[1] = _x1_trq(1);
+	_ext_torque.ft_motor_filter[2] = _x1_trq(2);
+
+	_ext_torque.timestamp = hrt_absolute_time();
+
+	if(_ext_torque_pub != nullptr){
+		orb_publish(ORB_ID(estimate_torque), _ext_torque_pub, &_ext_torque);
+	} else {
+		_ext_torque_pub = orb_advertise(ORB_ID(estimate_torque), &_ext_torque);
+	}
+
+	/* publish angular vel/acc */
+	_v_esti_att.rollspeed = _x1(0);
+	_v_esti_att.pitchspeed = _x1(1);
+	_v_esti_att.yawspeed = _x1(2);
+	_v_esti_att.rollacc = _x2(0);
+	_v_esti_att.pitchacc = _x2(1);
+	_v_esti_att.yawacc = _x2(2);
+	_v_esti_att.timestamp = hrt_absolute_time();
+
+	if(_v_esti_att_pub != nullptr) {
+		orb_publish(ORB_ID(vehicle_estimate_attitude), _v_esti_att_pub, &_v_esti_att);
+	} else {
+		_v_esti_att_pub = orb_advertise(ORB_ID(vehicle_estimate_attitude), &_v_esti_att);
+	}
+
+	/*********************************************************/
+	Vector3f alpha_TSMC(_i_alpha, _i_alpha, _i_alpha);
+	Vector3f c_TSMC(_i_c,_i_c,_i_c);
+	Vector3f T_TSMC(_i_t,_i_t,_i_t);
+	Vector3f eta_TSMC(_i_eta,_i_eta,_i_eta);
+	//   Vector3f S_TSMC(0,0,0);
+	Vector3f sign_S(0,0,0);
+
+	c_TSMC = c_TSMC.emult(rates_p_scaled);
+	//   T_TSMC = T_TSMC.emult(rates_i_scaled);
+	//   eta_TSMC = eta_TSMC.emult(rates_i_scaled);
+
+	//    S_TSMC = -_x2 + c_TSMC.emult(nolinear_part_TSMC(rates_err, alpha_TSMC));
+	get_funcg_integPart(c_TSMC, alpha_TSMC, rates_err, dt, _func_g);
+	_func_g = rates_err + _func_g;
+	for(int i = 0; i <= 2; i++)
+	{
+		sign_S(i) = math::signNoZero(_func_g(i) - _func_g_prev(i));
+	}
+	_func_g_prev = _func_g;
+
+	get_un_TSMC(T_TSMC, eta_TSMC, sign_S, dt, _un, _un_v);
+	Vector3f eq_cont_part(0,0,0);
+	eq_cont_part = - c_TSMC.emult(nolinear_part_TSMC(rates_err, alpha_TSMC));
+	Vector3f torque_att_ctrl(0,0,0);
+	if(_smc_enable > 0.5){
+		Vector3f att_ctrl = - c_TSMC.emult(nolinear_part_TSMC(rates_err, alpha_TSMC)) + _un*1.0f;
+		torque_att_ctrl = - inertia.emult(att_ctrl);
+		torque_att_ctrl = torque_att_ctrl + compen_torque * 1.f;
+		}
+	else{
+
+		Vector3f att_ctrl = rates_p_scaled.emult(rates_err) + _rates_int - rates_d_scaled.emult(rates_filtered - _rates_prev_filtered) / dt * 1.0f;
+		torque_att_ctrl = inertia.emult(att_ctrl);
+	}
+
+	if(_num_update%500 == 0){
+		// PX4_INFO("Sliding Mode Surfaces = %8.6f, %8.6f, %8.6f", (double)S_TSMC(0), (double)S_TSMC(1), (double)S_TSMC(2));
+		// PX4_INFO("un = %8.6f, %8.6f, %8.6f", (double)_un(0), (double)_un(1), (double)_un(2));
+		// PX4_INFO("att_ctrl = %8.6f, %8.6f, %8.6f", (double)att_ctrl(0), (double)att_ctrl(1), (double)att_ctrl(2));
+		// PX4_INFO("rates_p_scaled = %8.6f, %8.6f, %8.6f", (double)rates_p_scaled(0), (double)rates_p_scaled(1), (double)rates_p_scaled(2));
+		// PX4_INFO("rates_i_scaled = %8.6f, %8.6f, %8.6f", (double)rates_i_scaled(0), (double)rates_i_scaled(1), (double)rates_i_scaled(2));
+		// PX4_INFO("_smc_enable = %8.6f", (double)_smc_enable);
+
+	}
+
+
+	/* publish TSMC intermediate variables */
+	_v_TSMC_att.eq_part_roll= eq_cont_part(0);
+	_v_TSMC_att.eq_part_pitch = eq_cont_part(1);
+	_v_TSMC_att.eq_part_yaw = eq_cont_part(2);
+
+	_v_TSMC_att.disc_part_roll = _un(0);
+	_v_TSMC_att.disc_part_pitch = _un(1);
+	_v_TSMC_att.disc_part_yaw = _un(2);
+
+	_v_TSMC_att.sign_s_roll = sign_S(0);
+	_v_TSMC_att.sign_s_pitch = sign_S(1);
+	_v_TSMC_att.sign_s_yaw = sign_S(2);
+
+	_v_TSMC_att.rates_err_roll = rates_err(0);
+	_v_TSMC_att.rates_err_pitch = rates_err(1);
+	_v_TSMC_att.rates_err_yaw = rates_err(2);
+
+	_v_TSMC_att.timestamp = hrt_absolute_time();
+
+	if(_v_TSMC_att_pub != nullptr){
+		orb_publish(ORB_ID(vehicle_tsmc_attitude), _v_TSMC_att_pub, &_v_TSMC_att);
+	} else {
+		_v_TSMC_att_pub = orb_advertise(ORB_ID(vehicle_tsmc_attitude), &_v_TSMC_att);
+	}
+
+    /**********************************************************/
+
+	/* Convert torque command to normalized input */
+//    torque_att_ctrl = torque_att_ctrl + compen_torque * 1.f;
+
+
+//	_att_control = torque_to_attctrl(torque_att_ctrl);
+	if(_lossctrl_enable){
+		_att_control = torque_to_attctrl_motorloss(torque_att_ctrl);
+	}else {
+		_att_control = torque_to_attctrl(torque_att_ctrl);
+	}
+
+
+	_rates_prev = rates;
+	_rates_prev_filtered = rates_filtered;
+
+	/* update integral only if motors are providing enough thrust to be effective */
+	if (_thrust_sp > MIN_TAKEOFF_THRUST) {
+		for (int i = AXIS_INDEX_ROLL; i < AXIS_COUNT; i++) {
+			// Check for positive control saturation
+			bool positive_saturation =
+				((i == AXIS_INDEX_ROLL) && _saturation_status.flags.roll_pos) ||
+				((i == AXIS_INDEX_PITCH) && _saturation_status.flags.pitch_pos) ||
+				((i == AXIS_INDEX_YAW) && _saturation_status.flags.yaw_pos);
+
+			// Check for negative control saturation
+			bool negative_saturation =
+				((i == AXIS_INDEX_ROLL) && _saturation_status.flags.roll_neg) ||
+				((i == AXIS_INDEX_PITCH) && _saturation_status.flags.pitch_neg) ||
+				((i == AXIS_INDEX_YAW) && _saturation_status.flags.yaw_neg);
+
+			// prevent further positive control saturation
+			if (positive_saturation) {
+				rates_err(i) = math::min(rates_err(i), 0.0f);
+
+			}
+
+			// prevent further negative control saturation
+			if (negative_saturation) {
+				rates_err(i) = math::max(rates_err(i), 0.0f);
+
+			}
+
+			// Perform the integration using a first order method and do not propagate the result if out of range or invalid
+			float rate_i = _rates_int(i) + rates_i_scaled(i) * rates_err(i) * dt;
+
+			if (PX4_ISFINITE(rate_i) && rate_i > -_rate_int_lim(i) && rate_i < _rate_int_lim(i)) {
+				_rates_int(i) = rate_i;
+			}
+		}
+	}
+
+	/* explicitly limit the integrator state */
+	for (int i = AXIS_INDEX_ROLL; i < AXIS_COUNT; i++) {
+		_rates_int(i) = math::constrain(_rates_int(i), -_rate_int_lim(i), _rate_int_lim(i));
+
+	}
+}
+
+/**
+ * Estimator for attitude rates and accelerations using Runge-Kutta methods
+ */
+void MulticopterAttitudeControl::estimator_update(Vector3f x, const float dt, Vector3f &x1, Vector3f &x2)
+{
+	Vector3f x1_dot_1, x2_dot_1, x1_dot_2, x2_dot_2, x1_dot_3, x2_dot_3, x1_dot_4, x2_dot_4;
+	Vector3f x1_tmp, x2_tmp;
+
+	x1_tmp = x1;	// x1: estimate of x
+	x2_tmp = x2;	// x2: estimate of x' acceleration
+	estimator_model(x, x1_tmp, x2_tmp, x1_dot_1, x2_dot_1);
+
+	x1_tmp = x1 + x1_dot_1 * dt/2.0f;
+	x2_tmp = x2 + x2_dot_1 * dt/2.0f;
+	estimator_model(x, x1_tmp, x2_tmp, x1_dot_2, x2_dot_2);
+
+	x1_tmp = x1 + x1_dot_2 * dt/2.0f;
+	x2_tmp = x2 + x2_dot_2 * dt/2.0f;
+	estimator_model(x, x1_tmp, x2_tmp, x1_dot_3, x2_dot_3);
+
+	x1_tmp = x1 + x1_dot_3 * dt;
+	x2_tmp = x2 + x2_dot_3 * dt;
+	estimator_model(x, x1_tmp, x2_tmp, x1_dot_4, x2_dot_4);
+
+	x1 += (x1_dot_1 + x1_dot_2 * 2.0f + x1_dot_3 * 2.0f + x1_dot_4) * dt/6.0f;
+	x2 += (x2_dot_1 + x2_dot_2 * 2.0f + x2_dot_3 * 2.0f + x2_dot_4) * dt/6.0f;
+
+}
+
+/**
+ * Estimator model
+ * model: x_hat = wa^2 / (s^2 + 2*zeta*wa*s + wa^2) * x
+ * x1 = x_hat; x2 = x_dot_hat
+ * ==> x2_dot + 2*zeta*wa*x2 + wa^2*x1 = wa^2 * x
+ * ==> x1_dot = x2;
+ * 	   x2_dot = wa^2*(x - x1) - 2*zeta*wa*x2
+ */
+void MulticopterAttitudeControl::estimator_model(Vector3f &rates, Vector3f &x1, Vector3f &x2, Vector3f &x1_dot, Vector3f &x2_dot)
+{
+	x1_dot = x2;
+//	x2_dot =  (rates - x1) * OMEGA_ATT * OMEGA_ATT - x2 * 2.0f * ZETA_ATT * OMEGA_ATT;
+	x2_dot =  (rates - x1) * _omega_att * _omega_att - x2 * 2.0f * _zeta_att * _omega_att;
+}
+
+/**
+ * Transform computed torques to equivalent normalized inputs
+ */
+Vector3f
+MulticopterAttitudeControl::torque_to_attctrl(Vector3f &computed_torque)
+{
+	/* motor maximum thrust model */
+	float thrust_max = motor_max_thrust(_battery_status.voltage_filtered_v);
+
+	/* mixer matrix */
+	float array_mixer[4][3] = {
+			{-0.707107f,  0.707107f,  1.0f},
+			{0.707107f,  -0.707107f,  1.0f},
+			{0.707107f,  0.707107f,  -1.0f},
+			{-0.707107f,  -0.707107f,  -1.0f}
+	};
+	Matrix<float, 4, 3> mixer_matrix(array_mixer);
+
+//	if(_lossctrl_enable){
+////		int motor_fail_num = math::constrain(_lossctrl_enable, 1, 4);
+//
+//		for(int i = 0; i < 3; i++){
+//			mixer_matrix(motor_fail_num - 1, i) = 0.0f;
+//		}
+//	}
+
+	/* matrix from thrust of four propellers to torque about 3-axes */
+//	float array_torque[3][4] = {
+//			{-HALF_LENGTH, HALF_LENGTH, HALF_LENGTH, -HALF_LENGTH},
+//			{HALF_WIDTH, -HALF_WIDTH, HALF_WIDTH, -HALF_WIDTH},
+//			{C_M, C_M, -C_M, -C_M}
+//	};
+	float array_torque[3][4] = {
+			{-_half_length, _half_length, _half_length, -_half_length},
+			{_half_width, -_half_width, _half_width, -_half_width},
+			{_C_M, _C_M, -_C_M, -_C_M}
+	};
+	Matrix<float, 3, 4> gentrq_matrix(array_torque);
+
+	/* input = (Gamma * Mixer * Tmax)^(-1) * computed_torque */
+	SquareMatrix<float, 3> gentrq_mixer = Matrix<float, 3, 3>(gentrq_matrix * mixer_matrix);
+	Matrix<float, 3, 3> trq_to_attctrl = gentrq_mixer.I() / thrust_max;
+
+	return trq_to_attctrl * computed_torque;
+}
+/**
+ * Motor thrust model
+ */
+//　电压与推力的模型？
+inline float MulticopterAttitudeControl::motor_max_thrust(float battery_voltage)
+{
+	if(battery_voltage < 11.1f){
+		battery_voltage = 11.1f;
+	} else if(battery_voltage > 12.6f){
+		battery_voltage = 12.6;
+	}
+	return 1.0f*5.488f * sinf(battery_voltage * 0.4502f + 2.2241f);
+//	return 4.77f;
+}
+
+//　力矩与归一化控制量的模型？
+Vector3f
+MulticopterAttitudeControl::torque_to_attctrl_motorloss(Vector3f &computed_torque)
+{
+	/* motor maximum thrust model */
+	float thrust_max = motor_max_thrust(_battery_status.voltage_filtered_v);
+
+	/* mixer matrix */
+	/*float array_mixer[3][2] = {
+			{-1.0f,	 0.0f},
+			{0.0f,	-1.0f},
+			{1.0f,	1.0f}
+	};*/
+	float array_mixer[3][2] = {
+				{-0.867091f,	0.006471f},
+				{0.006471f,	-0.867091f},
+				{0.864934f,	0.864934f}
+	};
+	Matrix<float, 3, 2> mixer_matrix(array_mixer);
+
+	/* matrix from thrust of four propellers to torque about x-y axis */
+	float array_torque[2][3] = {
+			{-_half_length, _half_length, _half_length},
+			{_half_width, -_half_width, _half_width}
+	};
+	Matrix<float, 2, 3> gentrq_matrix(array_torque);
+
+	/* input = (Gamma * Mixer * Tmax)^(-1) * computed_torque */
+	SquareMatrix<float, 2> gentrq_mixer = Matrix<float, 2, 2>(gentrq_matrix * mixer_matrix);
+	Matrix<float, 2, 2> trq_to_attctrl = gentrq_mixer.I() / thrust_max;
+
+	Vector2f torque_xy = Vector2f(computed_torque(0), computed_torque(1));
+	Vector2f attctrl_xy = trq_to_attctrl * torque_xy;
+	Vector3f attctrl = Vector3f(attctrl_xy(0), attctrl_xy(1), 0.0f);
+
+	return attctrl;
+}
+
+/**
+ * Torque around 3-axis generated by four motor thrusts
+ */
+//　由油门反解当前力矩
+Vector3f
+MulticopterAttitudeControl::compute_actuate_torque()
+{
+	float thrust_max = motor_max_thrust(_battery_status.voltage_filtered_v);
+//	float array_torque[3][4] = {
+//			{-HALF_LENGTH, HALF_LENGTH, HALF_LENGTH, -HALF_LENGTH},
+//			{HALF_WIDTH, -HALF_WIDTH, HALF_WIDTH, -HALF_WIDTH},
+//			{C_M, C_M, -C_M, -C_M}
+//	};
+	float array_torque[3][4] = {
+			{-_half_length, _half_length, _half_length, -_half_length},
+			{_half_width, -_half_width, _half_width, -_half_width},
+			{_C_M, _C_M, -_C_M, -_C_M}
+	};
+	Matrix<float, 3, 4> gentrq_matrix(array_torque);
+	// motor thrust model:
+	// thrust = (1 - _thrust_factor) * PWM + _thrust_factor * PWM^2
+	float pwm[4];
+	float pwm_amp = _pwm_max_value - _pwm_min_value;
+//	pwm[0] = (1.0f + _actuator_outputs.output[0]) / 2.0f;
+//	pwm[1] = (1.0f + _actuator_outputs.output[1]) / 2.0f;
+//	pwm[2] = (1.0f + _actuator_outputs.output[2]) / 2.0f;
+//	pwm[3] = (1.0f + _actuator_outputs.output[3]) / 2.0f;
+	pwm[0] = math::constrain((_actuator_outputs.output[0] - _pwm_min_value) / pwm_amp, 0.f, 1.f);
+	pwm[1] = math::constrain((_actuator_outputs.output[1] - _pwm_min_value) / pwm_amp, 0.f, 1.f);
+	pwm[2] = math::constrain((_actuator_outputs.output[2] - _pwm_min_value) / pwm_amp, 0.f, 1.f);
+	pwm[3] = math::constrain((_actuator_outputs.output[3] - _pwm_min_value) / pwm_amp, 0.f, 1.f);
+	Vector<float, 4> throttle, thrust;
+//	throttle(0) = (1.0f - THRUST_FACTOR) * pwm[0] + THRUST_FACTOR * pwm[0] * pwm[0];
+//	throttle(1) = (1.0f - THRUST_FACTOR) * pwm[1] + THRUST_FACTOR * pwm[1] * pwm[1];
+//	throttle(2) = (1.0f - THRUST_FACTOR) * pwm[2] + THRUST_FACTOR * pwm[2] * pwm[2];
+//	throttle(3) = (1.0f - THRUST_FACTOR) * pwm[3] + THRUST_FACTOR * pwm[3] * pwm[3];
+	throttle(0) = (1.0f - _thrust_factor) * pwm[0] + _thrust_factor * pwm[0] * pwm[0];
+	throttle(1) = (1.0f - _thrust_factor) * pwm[1] + _thrust_factor * pwm[1] * pwm[1];
+	throttle(2) = (1.0f - _thrust_factor) * pwm[2] + _thrust_factor * pwm[2] * pwm[2];
+	throttle(3) = (1.0f - _thrust_factor) * pwm[3] + _thrust_factor * pwm[3] * pwm[3];
+	thrust = throttle * thrust_max;
+
+	if(_lossctrl_enable){
+		int motor_fail_num = math::constrain(_lossctrl_enable, 1, 4);
+		throttle(motor_fail_num -1) = 0.0f;
+		thrust(motor_fail_num -1) = 0.0f;
+	}
+
+//	if(_num_update%200 == 0 and _lossctrl_enable){
+////		PX4_INFO("thrust_max = %8.6f", (double)thrust_max);
+////		PX4_INFO("_pwm_min_value = %d", _pwm_min_value);
+////		PX4_INFO("_pwm_max_value = %d", _pwm_max_value);
+//		PX4_INFO("pwm = %8.6f, %8.6f, %8.6f, %8.6f", (double)pwm[0], (double)pwm[1], (double)pwm[2], (double)pwm[3]);
+//		PX4_INFO("throttle = %8.6f, %8.6f, %8.6f, %8.6f", (double)throttle(0), (double)throttle(1), (double)throttle(2), (double)throttle(3));
+////		PX4_INFO("thrust = %8.6f, %8.6f, %8.6f, %8.6f", (double)thrust(0), (double)thrust(1), (double)thrust(2), (double)thrust(3));
+//	}
+
+	return gentrq_matrix * thrust;
+}
+
 
 void
 MulticopterAttitudeControl::publish_rates_setpoint()
@@ -453,8 +1083,18 @@ MulticopterAttitudeControl::Run()
 		_actuators.timestamp_sample = angular_velocity.timestamp_sample;
 
 		/* run the rate controller immediately after a gyro update */
-		if (_v_control_mode.flag_control_rates_enabled) {
-			control_attitude_rates(dt, rates);
+		//　首先运行角速度环控制器
+		if (_v_control_mode.flag_control_rates_enabled)
+		{
+			if (controller_flag.get() == 0)
+			{
+				//　运行角度环控制器
+				control_attitude_rates(dt, rates);
+			}
+			else if (controller_flag.get()  == 1)
+			{
+				control_attitude_rates_motorloss_smc(dt, rates);
+			}
 
 			publish_actuator_controls();
 			publish_rate_controller_status();
@@ -493,17 +1133,28 @@ MulticopterAttitudeControl::Run()
 
 
 		if (run_att_ctrl) {
-			if (attitude_updated) {
+			if (attitude_updated)
+			{
 				// Generate the attitude setpoint from stick inputs if we are in Manual/Stabilized mode
 				if (_v_control_mode.flag_control_manual_enabled &&
 				    !_v_control_mode.flag_control_altitude_enabled &&
 				    !_v_control_mode.flag_control_velocity_enabled &&
-				    !_v_control_mode.flag_control_position_enabled) {
+				    !_v_control_mode.flag_control_position_enabled)
+				    {
 					generate_attitude_setpoint(_attitude_dt, _reset_yaw_sp);
-					attitude_setpoint_generated = true;
+					attitude_setpoint_generated = true;}
+
+				if (controller_flag.get()  == 0)
+				{
+					//　运行角度环控制器
+					control_attitude();
+				}
+				else if (controller_flag.get()  == 1)
+				{
+					control_attitude_motorloss_smc(_attitude_dt, rates);
 				}
 
-				control_attitude();
+
 
 				if (_v_control_mode.flag_control_yawrate_override_enabled) {
 					/* Yaw rate override enabled, overwrite the yaw setpoint */
@@ -544,6 +1195,7 @@ MulticopterAttitudeControl::Run()
 			if (!_vehicle_status.is_vtol) {
 				_rates_sp.zero();
 				_rate_control.resetIntegral();
+				_rates_int.zero();
 				_thrust_sp = 0.0f;
 				_att_control.zero();
 				publish_actuator_controls();

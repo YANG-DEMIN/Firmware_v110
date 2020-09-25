@@ -383,12 +383,35 @@ MultirotorMixer::mix(float *outputs, unsigned space)
 		mix_airmode_disabled(roll, pitch, yaw, thrust, outputs);
 		break;
 	}
-	// 修改混控，在这改根据roll, pitch, yaw, thrust来计算outputs
+
+	// 不使用上述mixer，自定义修改混控，在这改根据roll, pitch, yaw, thrust来计算outputs
 	float sqrt_2 = sqrt(2)/2;
-	outputs[0] = -sqrt_2 * roll +  sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
-	outputs[1] =  sqrt_2 * roll + -sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
-	outputs[2] =  sqrt_2 * roll +  sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
-	outputs[3] = -sqrt_2 * roll + -sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
+
+	float array_mixer[4][4] = {
+				{-0.867091f,	 0.006471f,	0.0f,	1.492574f},
+				{0.006471f,	-0.867091f,	0.0f,	1.492574f},
+				{0.864934f,	0.864934f,	0.0f,	0.014851f},
+				{0.0f,	0.0f,	0.0f,	0.0f}
+	};
+
+	//　待赋值，从外部输入
+	bool _motor_fail = true;
+
+	if(!_motor_fail) {
+		outputs[0] = -sqrt_2 * roll +  sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
+		outputs[1] =  sqrt_2 * roll + -sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
+		outputs[2] =  sqrt_2 * roll +  sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
+		outputs[3] = -sqrt_2 * roll + -sqrt_2 * pitch + sqrt_2 * yaw + sqrt_2 * thrust;
+	} else {
+		outputs[0] =  array_mixer[0][0] * roll +  array_mixer[0][1] * pitch + array_mixer[0][3] * thrust;
+		outputs[1] =  array_mixer[1][0] * roll +  array_mixer[1][1] * pitch + array_mixer[1][3] * thrust;
+		outputs[2] =  array_mixer[2][0] * roll +  array_mixer[2][1] * pitch + array_mixer[2][3] * thrust;
+		outputs[3] =  array_mixer[3][0] * roll +  array_mixer[3][1] * pitch + array_mixer[3][3] * thrust;
+	}
+
+	// mix　两次　，待补充
+
+	// outputs[3] = 0.0;
 
 	// 下面还可以使用油门 - 推力 模型
 

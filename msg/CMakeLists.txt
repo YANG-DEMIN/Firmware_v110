@@ -148,6 +148,16 @@ set(msg_files
 	vtol_vehicle_status.msg
 	wheel_encoders.msg
 	wind_estimate.msg
+	estimate_disturb.msg
+	vehicle_estimate_attitude.msg
+	vehicle_estimate_position.msg
+	vehicle_tsmc_attitude.msg
+	# Added for algorithm development
+	#
+	#
+	#
+	# # For TSMC control parameters tuning
+	#
 	)
 
 if(NOT EXTERNAL_MODULES_LOCATION STREQUAL "")

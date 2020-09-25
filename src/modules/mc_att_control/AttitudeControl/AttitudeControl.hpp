@@ -81,4 +81,5 @@ private:
 	matrix::Vector3f _proportional_gain;
 	matrix::Vector3f _rate_limit;
 	float _yaw_w = 0.0f; /**< yaw weight [0,1] to prioritize roll and pitch */
+
 };
