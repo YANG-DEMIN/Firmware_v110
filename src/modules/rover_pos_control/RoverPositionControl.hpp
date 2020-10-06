@@ -65,6 +65,7 @@
 #include <uORB/topics/vehicle_control_mode.h>
 #include <uORB/topics/vehicle_global_position.h>
 #include <uORB/topics/vehicle_local_position.h>
+#include <uORB/topics/vehicle_attitude_setpoint.h>
 #include <uORB/topics/actuator_controls.h>
 #include <uORB/topics/ekf2_timestamps.h>
 #include <uORB/uORB.h>
@@ -106,6 +107,7 @@ private:
 	int		_local_pos_sub{-1};
 	int		_manual_control_sub{-1};		/**< notification of manual control updates */
 	int		_pos_sp_triplet_sub{-1};
+	int		_att_sp_sub{-1};
 	int     _vehicle_attitude_sub{-1};
 	int		_sensor_combined_sub{-1};
 
@@ -113,6 +115,7 @@ private:
 
 	manual_control_setpoint_s		_manual{};			    /**< r/c channel data */
 	position_setpoint_triplet_s		_pos_sp_triplet{};		/**< triplet of mission items */
+	vehicle_attitude_setpoint_s		_att_sp{};
 	vehicle_control_mode_s			_control_mode{};		/**< control mode */
 	vehicle_global_position_s		_global_pos{};			/**< global vehicle position */
 	vehicle_local_position_s		_local_pos{};			/**< global vehicle position */
@@ -141,6 +144,14 @@ private:
 		UGV_POSCTRL_MODE_AUTO,
 		UGV_POSCTRL_MODE_OTHER
 	} _control_mode_current{UGV_POSCTRL_MODE_OTHER};			///< used to check the mode in the last control loop iteration. Use to check if the last iteration was in the same mode.
+
+	enum POS_CTRLSTATES {
+		GOTO_WAYPOINT,
+		STOPPING
+	} _pos_ctrl_state {STOPPING};			/// Position control state machine
+
+	/* previous waypoint */
+	matrix::Vector2f _prev_wp{0.0f, 0.0f};
 
 	DEFINE_PARAMETERS(
 		(ParamFloat<px4::params::GND_L1_PERIOD>) _param_l1_period,
@@ -172,6 +183,7 @@ private:
 
 	void		manual_control_setpoint_poll();
 	void		position_setpoint_triplet_poll();
+	void		attitude_setpoint_poll();
 	void		vehicle_control_mode_poll();
 	void 		vehicle_attitude_poll();
 
@@ -180,5 +192,7 @@ private:
 	 */
 	bool		control_position(const matrix::Vector2f &global_pos, const matrix::Vector3f &ground_speed,
 					 const position_setpoint_triplet_s &_pos_sp_triplet);
+	void		control_velocity(const matrix::Vector3f &current_velocity, const position_setpoint_triplet_s &pos_sp_triplet);
+	void		control_attitude(const vehicle_attitude_s &att, const vehicle_attitude_setpoint_s &att_sp);
 
 };
