@@ -47,6 +47,8 @@ px4_add_module(
 		devices/src/rtcm.cpp
 		devices/src/emlid_reach.cpp
 		devices/src/femtomes.cpp
+		
+		devices/src/nmea.cpp
 	MODULE_CONFIG
 		module.yaml
 	DEPENDS

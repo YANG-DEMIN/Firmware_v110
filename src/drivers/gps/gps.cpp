@@ -63,6 +63,7 @@
 #include "devices/src/mtk.h"
 #include "devices/src/ubx.h"
 #include "devices/src/femtomes.h"
+#include "devices/src/nmea.h"
 
 #ifdef __PX4_LINUX
 #include <linux/spi/spidev.h>
@@ -77,7 +78,8 @@ typedef enum {
 	GPS_DRIVER_MODE_MTK,
 	GPS_DRIVER_MODE_ASHTECH,
 	GPS_DRIVER_MODE_EMLIDREACH,
-	GPS_DRIVER_MODE_FEMTOMES
+	GPS_DRIVER_MODE_FEMTOMES,
+	GPS_DRIVER_MODE_NMEA
 } gps_driver_mode_t;
 
 /* struct for dynamic allocation of satellite info data */
@@ -695,6 +697,7 @@ GPS::run()
 				_helper = nullptr;
 			}
 
+			_mode = GPS_DRIVER_MODE_NMEA;		//!!! fix the protocol !!!
 			switch (_mode) {
 			case GPS_DRIVER_MODE_NONE:
 				_mode = GPS_DRIVER_MODE_UBX;
@@ -721,11 +724,18 @@ GPS::run()
 				_helper = new GPSDriverFemto(&GPS::callback, this, &_report_gps_pos, _p_report_sat_info,heading_offset);
 				break;
 
+			case GPS_DRIVER_MODE_NMEA:
+				_helper = new GPSDriverNMEA(&GPS::callback, this, &_report_gps_pos, _p_report_sat_info,heading_offset);
+				PX4_INFO("I am NMEA!!!");
+				break;
 			default:
 				break;
 			}
 
-			_baudrate = _configured_baudrate;
+			//PX4_INFO("My mode is : %d", _mode);
+			//PX4_INFO("I am in the loop!!!");
+			//_baudrate = _configured_baudrate;
+			_baudrate = 115200;
 
 			if (_helper && _helper->configure(_baudrate, GPSHelper::OutputMode::GPS) == 0) {
 
@@ -734,6 +744,7 @@ GPS::run()
 				_report_gps_pos.heading = NAN;
 				_report_gps_pos.heading_offset = heading_offset;
 
+				//PX4_INFO("I am here!!!");
 				if (_mode == GPS_DRIVER_MODE_UBX) {
 
 					/* GPS is obviously detected successfully, reset statistics */
@@ -741,6 +752,8 @@ GPS::run()
 				}
 
 				int helper_ret;
+
+				//PX4_INFO("helper_ret = %d",_helper->receive(TIMEOUT_5HZ));
 
 				while ((helper_ret = _helper->receive(TIMEOUT_5HZ)) > 0 && !should_exit()) {
 
@@ -824,6 +837,10 @@ GPS::run()
 					break;
 
 				case GPS_DRIVER_MODE_FEMTOMES:
+					_mode = GPS_DRIVER_MODE_NMEA;
+					break;
+
+				case GPS_DRIVER_MODE_NMEA:
 					_mode = GPS_DRIVER_MODE_UBX;
 					px4_usleep(500000); // tried all possible drivers. Wait a bit before next round
 					break;
@@ -891,6 +908,9 @@ GPS::print_status()
 		case GPS_DRIVER_MODE_FEMTOMES:
 			PX4_INFO("protocol: FEMTOMES");
 			break;
+
+		case GPS_DRIVER_MODE_NMEA:
+			PX4_INFO("protocol: NMEA");
 
 		default:
 			break;
