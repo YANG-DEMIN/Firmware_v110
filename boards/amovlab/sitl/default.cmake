@@ -1,7 +1,7 @@
 
 px4_add_board(
 	PLATFORM posix
-	VENDOR px4
+	VENDOR amovlab
 	MODEL sitl
 	LABEL default
 	TESTING
