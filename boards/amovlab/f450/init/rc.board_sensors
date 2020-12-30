@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# AMOVLAB F450 specific board sensors init
+#------------------------------------------------------------------------------
+
+# Internal SPI bus ICM-20602
+mpu6000 -R 8 -s -T 20602 start
+
+# Internal SPI bus ICM-20689
+mpu6000 -R 8 -z -T 20689 start
+
+# Internal SPI bus BMI055 accel
+bmi055 -A -R 10 start
+
+# Internal SPI bus BMI055 gyro
+bmi055 -G -R 10 start
+
+# Possible external compasses
+ist8310 -C -b 1 start
+ist8310 -C -b 2 start
+hmc5883 -C -T -X start
+qmc5883 -X start
+lis3mdl -X start
+
+# ICM20948 as external magnetometer on I2C (e.g. Here GPS)
+if ! icm20948 -X -M -R 6 start
+then
+	# external emulated AK09916 (Here2) is rotated 270 degrees yaw
+	ak09916 -X -R 6 start
+fi
+
+# Possible internal compass
+ist8310 -C -b 5 start
+
+# Baro on internal SPI
+ms5611 -s start
