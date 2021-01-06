@@ -63,6 +63,7 @@
 #include "devices/src/mtk.h"
 #include "devices/src/ubx.h"
 #include "devices/src/femtomes.h"
+#include "devices/src/nmea.h"
 
 #ifdef __PX4_LINUX
 #include <linux/spi/spidev.h>
@@ -77,7 +78,8 @@ typedef enum {
 	GPS_DRIVER_MODE_MTK,
 	GPS_DRIVER_MODE_ASHTECH,
 	GPS_DRIVER_MODE_EMLIDREACH,
-	GPS_DRIVER_MODE_FEMTOMES
+	GPS_DRIVER_MODE_FEMTOMES,
+	GPS_DRIVER_MODE_NMEA
 } gps_driver_mode_t;
 
 /* struct for dynamic allocation of satellite info data */
@@ -694,6 +696,7 @@ GPS::run()
 				delete (_helper);
 				_helper = nullptr;
 			}
+			_mode = GPS_DRIVER_MODE_NMEA;
 
 			switch (_mode) {
 			case GPS_DRIVER_MODE_NONE:
@@ -721,11 +724,17 @@ GPS::run()
 				_helper = new GPSDriverFemto(&GPS::callback, this, &_report_gps_pos, _p_report_sat_info,heading_offset);
 				break;
 
+			case GPS_DRIVER_MODE_NMEA:
+				_helper = new GPSDriverNMEA(&GPS::callback, this, &_report_gps_pos, _p_report_sat_info,heading_offset);
+				break;
+
 			default:
 				break;
 			}
 
-			_baudrate = _configured_baudrate;
+			//_baudrate = _configured_baudrate;
+			_baudrate = 115200;
+
 
 			if (_helper && _helper->configure(_baudrate, GPSHelper::OutputMode::GPS) == 0) {
 
@@ -824,6 +833,10 @@ GPS::run()
 					break;
 
 				case GPS_DRIVER_MODE_FEMTOMES:
+					_mode = GPS_DRIVER_MODE_NMEA;
+					break;
+
+				case GPS_DRIVER_MODE_NMEA:
 					_mode = GPS_DRIVER_MODE_UBX;
 					px4_usleep(500000); // tried all possible drivers. Wait a bit before next round
 					break;
@@ -890,6 +903,9 @@ GPS::print_status()
 
 		case GPS_DRIVER_MODE_FEMTOMES:
 			PX4_INFO("protocol: FEMTOMES");
+			break;
+		case GPS_DRIVER_MODE_NMEA:
+			PX4_INFO("protocol: NMEA");
 			break;
 
 		default:
