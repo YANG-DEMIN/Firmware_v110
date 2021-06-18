@@ -10,6 +10,7 @@ Inputs to the mixer come from channel group 0 (vehicle attitude), channels 2 (ya
 
 See the README for more information on the scaler format.
 
+yaw->2 Throttle->3
 
 Throttle of left wheels of rover on Output 0
 ---------------------------------------

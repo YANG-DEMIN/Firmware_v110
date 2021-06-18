@@ -108,7 +108,7 @@ private:
 	int		_manual_control_sub{-1};		/**< notification of manual control updates */
 	int		_pos_sp_triplet_sub{-1};
 	int		_att_sp_sub{-1};
-	int     _vehicle_attitude_sub{-1};
+	int    		_vehicle_attitude_sub{-1};
 	int		_sensor_combined_sub{-1};
 
 	uORB::Subscription	_parameter_update_sub{ORB_ID(parameter_update)};
