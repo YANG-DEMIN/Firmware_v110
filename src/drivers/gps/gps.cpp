@@ -734,7 +734,7 @@ GPS::run()
 
 			//PX4_INFO("My mode is : %d", _mode);
 			//PX4_INFO("I am in the loop!!!");
-			//_baudrate = _configured_baudrate;
+			_baudrate = _configured_baudrate;
 			_baudrate = 115200;
 
 			if (_helper && _helper->configure(_baudrate, GPSHelper::OutputMode::GPS) == 0) {
